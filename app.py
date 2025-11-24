@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -9,19 +8,22 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-# 設定 AI
+# 1. 檢查並設定 AI
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
-# 記憶體資料庫
+# 啟動時印出 API Key 狀態 (只印前4碼以免洩漏)
+if GEMINI_API_KEY:
+    print(f"API Key 載入成功: {GEMINI_API_KEY[:4]}******")
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("❌ 嚴重錯誤：找不到 GEMINI_API_KEY 環境變數")
+
 fake_db = {} 
 
 @app.route("/")
 def home():
-    return "Simple AI Lunch API is Running!"
+    return "Diagnostic AI Lunch API is Running!"
 
-# 核心功能：AI 分析
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
     data = request.json
@@ -29,45 +31,49 @@ def analyze_menu():
     print(f"收到網址: {url}")
 
     try:
+        # 檢查 1: API Key 是否存在
         if not GEMINI_API_KEY:
-            raise Exception("No API Key")
+            raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
-        # 啟用 Google 搜尋工具
-        tools = {'google_search': {}}
-        model = genai.GenerativeModel('gemini-1.5-flash', tools=tools)
-        
-        # 直接請 AI 搜尋這個網址的相關資訊
+        # 檢查 2: 嘗試建立模型 (這裡最容易出錯)
+        try:
+            # 嘗試使用 Google 搜尋工具
+            tools = {'google_search': {}}
+            model = genai.GenerativeModel('gemini-1.5-flash', tools=tools)
+        except Exception as model_err:
+            print(f"模型建立失敗: {model_err}")
+            # 如果工具語法錯誤，降級為無工具模式
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            print("已降級為無搜尋工具模式")
+
+        # 提示詞
         prompt = f"""
-        請幫我調查這個 Google Maps 連結：{url}
-
-        【任務】
-        1. 利用 Google 搜尋找出這家餐廳的「正確店名」。
-        2. 搜尋這家店的「最新菜單」和「價格」。
-        3. 如果連結失效或找不到，請隨機推薦一家台灣熱門午餐餐廳的資料給我。
-
-        【輸出 JSON 格式】
+        請分析這個餐廳連結：{url}
+        找出「店名」與「菜單」。
+        如果無法上網搜尋，請根據網址結構猜測店名。
+        
+        回傳 JSON 格式：
         {{
             "name": "店名",
             "address": "地址",
             "phone": "電話",
             "minDelivery": 0,
-            "menu": [
-                {{"id": 1, "name": "招牌便當", "price": 100}},
-                {{"id": 2, "name": "雞腿飯", "price": 110}}
-            ]
+            "menu": [{{"id": 1, "name": "範例餐點", "price": 100}}]
         }}
         """
         
         response = model.generate_content(prompt)
         
-        # 清理並解析 JSON
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
-        # 有時候 AI 會回傳多餘文字，嘗試抓取大括號內的內容
-        match = re.search(r'\{.*\}', clean_json, re.DOTALL)
-        if match:
-            ai_data = json.loads(match.group())
-        else:
-            ai_data = json.loads(clean_json)
+        try:
+            match = re.search(r'\{.*\}', clean_json, re.DOTALL)
+            if match:
+                ai_data = json.loads(match.group())
+            else:
+                ai_data = json.loads(clean_json)
+        except:
+            # 如果 JSON 解析失敗，回傳原始文字以便除錯
+            raise Exception(f"AI 回傳了非 JSON 格式: {clean_json[:50]}...")
 
         # 補 ID
         for idx, item in enumerate(ai_data.get('menu', [])):
@@ -76,14 +82,18 @@ def analyze_menu():
         return jsonify(ai_data)
 
     except Exception as e:
-        print(f"AI 失敗: {e}")
-        # 失敗時的回傳
+        error_msg = str(e)
+        print(f"❌ 發生錯誤: {error_msg}")
+        
+        # 【關鍵修改】把錯誤訊息直接回傳給前端顯示
         return jsonify({
-            "name": "無法讀取 (請檢查 Render Logs)",
-            "address": "請手動輸入",
-            "phone": "",
+            "name": f"錯誤: {error_msg}",  # 這裡會顯示具體原因
+            "address": "請截圖這個畫面給 AI 助手看",
+            "phone": "000",
             "minDelivery": 0,
-            "menu": [{"id": 1, "name": "手動輸入餐點", "price": 0}]
+            "menu": [
+                {"id": 1, "name": "發生錯誤，請看上方店名欄位", "price": 0}
+            ]
         })
 
 # --- 其他 API (保持不變) ---
