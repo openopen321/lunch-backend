@@ -1,1 +1,6 @@
-flaskflask-corsgoogle-generativeai>=0.7.0gunicornrequestsbeautifulsoup4
+flask
+flask-cors
+google-generativeai>=0.7.0
+gunicorn
+requests
+beautifulsoup4
