@@ -1,7 +1,7 @@
 import os
 import json
 import re
-import uuid  # <--- 剛剛就是少了這個！
+import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -9,20 +9,16 @@ import google.generativeai as genai
 app = Flask(__name__)
 CORS(app)
 
-# 1. 檢查並設定 AI
+# 設定 AI
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-
 if GEMINI_API_KEY:
-    print(f"API Key 載入成功: {GEMINI_API_KEY[:4]}******")
     genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("❌ 嚴重錯誤：找不到 GEMINI_API_KEY 環境變數")
 
 fake_db = {} 
 
 @app.route("/")
 def home():
-    return "Fixed AI Lunch API is Running!"
+    return "Gemini 1.5 Pro Backend is Running!"
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
@@ -34,30 +30,38 @@ def analyze_menu():
         if not GEMINI_API_KEY:
             raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
+        # 建立模型 (嘗試多種可能)
+        model = None
         try:
+            # 首選：Gemini 1.5 Pro + 搜尋工具 (更聰明)
             tools = {'google_search': {}}
-            model = genai.GenerativeModel('gemini-1.5-flash', tools=tools)
-        except Exception as model_err:
-            print(f"模型建立失敗: {model_err}")
+            model = genai.GenerativeModel('gemini-1.5-pro', tools=tools)
+            print("使用模型: Gemini 1.5 Pro (含搜尋)")
+        except:
+            # 備案：如果 Pro 失敗，嘗試 Flash
+            print("Pro 模式失敗，降級為 Flash")
             model = genai.GenerativeModel('gemini-1.5-flash')
 
         prompt = f"""
-        請分析這個餐廳連結：{url}
-        找出「店名」與「菜單」。
-        如果無法上網搜尋，請根據網址結構猜測店名。
+        請調查這個餐廳網址：{url}
+        這是一個 Google Maps 連結。
+        請利用 Google 搜尋找出這家店的「正確店名」以及最新的「菜單」。
         
-        回傳 JSON 格式：
+        【輸出格式 JSON】
         {{
             "name": "店名",
             "address": "地址",
             "phone": "電話",
             "minDelivery": 0,
-            "menu": [{{"id": 1, "name": "範例餐點", "price": 100}}]
+            "menu": [
+                {{ "id": 1, "name": "餐點名稱", "price": 100 }}
+            ]
         }}
         """
         
         response = model.generate_content(prompt)
         
+        # 清理並解析 JSON
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
         try:
             match = re.search(r'\{.*\}', clean_json, re.DOTALL)
@@ -66,29 +70,40 @@ def analyze_menu():
             else:
                 ai_data = json.loads(clean_json)
         except:
-            raise Exception(f"AI 回傳格式錯誤: {clean_json[:50]}...")
+            # 如果 AI 還是沒給 JSON，手動構造一個
+            ai_data = {
+                "name": "AI 讀取失敗",
+                "address": "",
+                "phone": "",
+                "minDelivery": 0,
+                "menu": [{"id": 1, "name": "請手動輸入", "price": 0}]
+            }
 
+        # 補 ID
         for idx, item in enumerate(ai_data.get('menu', [])):
             item['id'] = idx + 1
             
         return jsonify(ai_data)
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ 發生錯誤: {error_msg}")
+        error_str = str(e)
+        print(f"❌ 發生錯誤: {error_str}")
+        
+        if "404" in error_str and "not found" in error_str:
+            error_str = "請確認 requirements.txt 已更新，並且 Render 已重新部署"
+
         return jsonify({
-            "name": f"錯誤: {error_msg}",
-            "address": "請截圖這個畫面",
-            "phone": "000",
+            "name": f"錯誤: {error_str}",
+            "address": "請檢查後端設定",
+            "phone": "",
             "minDelivery": 0,
-            "menu": [{"id": 1, "name": "發生錯誤，請看上方店名欄位", "price": 0}]
+            "menu": [{"id": 1, "name": "無法載入", "price": 0}]
         })
 
 # --- 其他 API ---
 @app.route("/api/create_group", methods=['POST'])
 def create_group():
     data = request.json
-    # 這裡就是剛剛報錯的地方，現在修好了
     group_id = str(uuid.uuid4())[:8]
     fake_db[group_id] = {"id": group_id, "restaurant": data['restaurant'], "orders": [], "status": "OPEN"}
     return jsonify({"group_id": group_id})
