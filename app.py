@@ -7,7 +7,7 @@ from flask_cors import CORS
 import google.generativeai as genai
 
 app = Flask(__name__)
-# 設定最大上傳限制為 16MB (避免圖片太大報錯)
+# 設定最大上傳限制為 16MB (避免傳送大圖片時報錯)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 CORS(app)
 
@@ -172,7 +172,8 @@ def update_payment(group_id):
     # 尋找並更新該筆訂單
     updated = False
     for order in fake_db[group_id]['orders']:
-        if str(order['id']) == str(order_id): # 轉字串比較較保險
+        # 轉成字串比較比較保險
+        if str(order['id']) == str(order_id):
             # 如果 amount 是空字串或 None，設為 0，否則轉整數
             order['paidAmount'] = int(amount) if amount and str(amount).isdigit() else 0
             updated = True
