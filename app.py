@@ -3,6 +3,8 @@ import json
 import re
 import uuid
 import sys
+import urllib.parse
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -15,97 +17,118 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# --- 關鍵功能：自動尋找可用模型 ---
-def get_best_available_model():
+# --- 輔助函式：還原短網址並擷取店名 ---
+def resolve_and_extract_name(url):
     """
-    不猜測模型名稱，直接詢問 API 有哪些模型可用，
-    並優先選擇含有 'flash' 或 'pro' 的生成模型。
+    嘗試將 maps.app.goo.gl 短網址還原，並從中提取店名。
+    這能大幅增加 AI 判斷的準確率。
     """
     try:
-        print("正在查詢可用模型清單...")
+        print(f"正在解析網址: {url}")
+        # 1. 還原長網址 (設定 timeout 避免卡住)
+        # 偽裝 User-Agent 避免被秒擋
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, allow_redirects=True, timeout=5)
+        long_url = response.url
+        print(f"還原後網址: {long_url}")
+
+        # 2. 嘗試從長網址中抓取 /place/店名/
+        # 格式通常是 https://www.google.com/maps/place/店名/@座標...
+        if "/place/" in long_url:
+            parts = long_url.split("/place/")
+            if len(parts) > 1:
+                # 取出店名部分，並做 URL Decode (把 %E9%BC... 轉回中文)
+                raw_name = parts[1].split("/")[0]
+                name = urllib.parse.unquote(raw_name).replace("+", " ")
+                print(f"網址內含店名: {name}")
+                return name
+    except Exception as e:
+        print(f"網址解析失敗 (不影響後續 AI 執行): {e}")
+    
+    return None
+
+# --- 自動尋找可用模型 ---
+def get_best_available_model():
+    try:
         available_models = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 available_models.append(m.name)
         
-        print(f"找到的模型: {available_models}")
-
-        # 策略 1: 優先找 Flash (速度快)
+        # 優先順序：Flash > Pro
         for name in available_models:
-            if 'flash' in name.lower() and 'legacy' not in name.lower():
-                return name
-        
-        # 策略 2: 其次找 Pro (性能強)
+            if 'flash' in name.lower() and 'legacy' not in name.lower(): return name
         for name in available_models:
-            if 'pro' in name.lower() and 'legacy' not in name.lower():
-                return name
-                
-        # 策略 3: 隨便回傳第一個能用的
-        if available_models:
-            return available_models[0]
-            
-    except Exception as e:
-        print(f"查詢模型失敗: {e}")
-    
-    # 如果連查詢都失敗，只好回傳一個最通用的預設值
+            if 'pro' in name.lower() and 'legacy' not in name.lower(): return name
+        if available_models: return available_models[0]
+    except:
+        pass
     return "models/gemini-1.5-flash"
 
 fake_db = {} 
 
 @app.route("/")
 def home():
-    return "Auto-Discovery AI Lunch API is Running!"
+    return "Precision AI Lunch API Running!"
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
     data = request.json
     url = data.get('url')
-    print(f"收到網址: {url}")
+    
+    # 1. 先嘗試用 Python 硬解店名
+    extracted_name = resolve_and_extract_name(url)
+    
+    # 2. 決定搜尋關鍵字
+    if extracted_name:
+        search_query = f"{extracted_name} 菜單 價格"
+        context_info = f"我們已經從網址確認這家店名叫做：「{extracted_name}」。"
+    else:
+        search_query = f"Google Maps 網址 {url} 的餐廳菜單"
+        context_info = "請試著從網址中分析店名。"
 
     try:
         if not GEMINI_API_KEY:
             raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
-        # 動態取得最佳模型
         model_name = get_best_available_model()
-        print(f"決定使用的模型: {model_name}")
+        print(f"使用模型: {model_name}")
 
         try:
-            # 嘗試啟用搜尋工具
             tools = {'google_search': {}}
             model = genai.GenerativeModel(model_name, tools=tools)
         except:
-            print("搜尋工具不可用，降級為普通模式")
             model = genai.GenerativeModel(model_name)
 
+        # --- 嚴格版提示詞 ---
         prompt = f"""
-        你是一個專業的台灣團購小幫手。請調查這個 Google Maps 餐廳連結：{url}
+        請執行 Google 搜尋：{search_query}
         
-        【任務】
-        1. 找出「正確店名」。
-        2. 找出最新的「菜單」與「價格」(台幣)。
-        3. 請忽略營業時間（即使休息中也要找出菜單）。
+        【重要資訊】
+        {context_info}
+
+        【任務目標】
+        1. 找出這家餐廳最新的「菜單」與「價格」(TWD)。
+        2. 請忽略「休息中」或「已打烊」的狀態。
+        
+        【嚴格限制】
+        1. **絕對禁止捏造菜單**。如果你找不到這家特定餐廳的菜單，請直接回傳空白菜單，不要隨機生成別家店的資料。
+        2. 如果找到的資料很舊，請盡量使用。
 
         【輸出 JSON 格式】
         {{
-            "name": "店名",
-            "address": "地址",
-            "phone": "電話",
+            "name": "{extracted_name if extracted_name else '搜尋到的店名'}",
+            "address": "搜尋到的地址",
+            "phone": "搜尋到的電話",
             "minDelivery": 0,
             "menu": [
-                {{ "id": 1, "name": "餐點名稱", "price": 100 }}
+                {{ "id": 1, "name": "菜色名稱", "price": 100 }}
             ]
         }}
         """
         
-        # 執行 AI
-        try:
-            response = model.generate_content(prompt)
-        except Exception as api_error:
-            # 如果這裡還錯，代表 API Key 可能有問題 (例如沒有權限存取該模型)
-            raise Exception(f"模型 {model_name} 執行失敗: {api_error}")
-
-        # 解析結果
+        response = model.generate_content(prompt)
+        
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
         try:
             match = re.search(r'\{.*\}', clean_json, re.DOTALL)
@@ -115,12 +138,16 @@ def analyze_menu():
                 ai_data = json.loads(clean_json)
         except:
             ai_data = {
-                "name": f"讀取失敗 ({model_name})",
+                "name": extracted_name if extracted_name else "讀取失敗",
                 "address": "請手動輸入",
                 "phone": "",
                 "minDelivery": 0,
-                "menu": [{"id": 1, "name": "請手動輸入餐點", "price": 0}]
+                "menu": [{"id": 1, "name": "AI 找不到菜單，請手動輸入", "price": 0}]
             }
+
+        # 檢查 AI 是否回傳了空的或錯誤的店名，如果是，強制使用我們抓到的店名
+        if extracted_name and (ai_data.get("name") == "店名" or not ai_data.get("name")):
+            ai_data["name"] = extracted_name
 
         # 補 ID
         for idx, item in enumerate(ai_data.get('menu', [])):
@@ -133,8 +160,8 @@ def analyze_menu():
         print(f"❌ 發生錯誤: {error_str}")
         
         return jsonify({
-            "name": f"錯誤: {error_str}",
-            "address": "請檢查後端 Logs", 
+            "name": f"系統錯誤: {error_str}",
+            "address": "", 
             "phone": "",
             "minDelivery": 0,
             "menu": [{"id": 1, "name": "無法載入", "price": 0}]
