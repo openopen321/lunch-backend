@@ -7,12 +7,13 @@ from flask_cors import CORS
 import google.generativeai as genai
 
 app = Flask(__name__)
+# 設定最大上傳限制為 16MB
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 CORS(app)
 
-# --- 資料持久化設定 ---
+# --- 資料持久化設定 (防止資料遺失) ---
 DB_FILE = 'database.json'        # 存團購訂單
-RESTAURANT_FILE = 'restaurants.json' # 存餐廳菜單 (新功能)
+RESTAURANT_FILE = 'restaurants.json' # 存餐廳菜單
 
 def load_json(filename):
     if os.path.exists(filename):
@@ -32,7 +33,7 @@ def save_json(filename, data):
 
 # 初始化資料庫
 fake_db = load_json(DB_FILE)
-restaurants_db = load_json(RESTAURANT_FILE) # { "餐廳名": {data...}, ... }
+restaurants_db = load_json(RESTAURANT_FILE)
 
 # --- Gemini AI 設定 ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -48,7 +49,7 @@ def home():
         ver = "未知"
     return f"Bento System API Running! (GenAI Ver: {ver})"
 
-# --- 1. AI 辨識 API (增強版：抓取副標題) ---
+# --- 1. AI 辨識 API ---
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
     try:
@@ -65,7 +66,7 @@ def analyze_menu():
 
         image_part = {"mime_type": mime_type, "data": image_data}
 
-        # 更新 Prompt：要求擷取 description
+        # Prompt：要求擷取 description
         prompt = """
         你是一個專業的菜單辨識助手。請分析這張菜單圖片。
         
@@ -86,7 +87,7 @@ def analyze_menu():
         }
         """
 
-        # 動態抓取模型 (保留您之前的需求)
+        # 動態抓取並排序模型 (版本號新 -> 舊)
         def get_sorted_models():
             try:
                 found_models = []
@@ -95,12 +96,13 @@ def analyze_menu():
                         name = m.name.replace('models/', '')
                         if 'gemini' in name.lower():
                             found_models.append(name)
-                # 排序版本號 (新->舊)
+                # 使用正則表達式抓取版本號進行排序
                 found_models.sort(key=lambda x: float(re.search(r'(\d+(?:\.\d+)+)', x).group(1)) if re.search(r'(\d+(?:\.\d+)+)', x) else 0, reverse=True)
                 return found_models
             except: return []
 
         candidate_models = get_sorted_models()
+        # 保底清單
         if not candidate_models: candidate_models = ["gemini-1.5-flash", "gemini-1.5-pro"]
             
         response = None
@@ -136,7 +138,7 @@ def analyze_menu():
                 "id": idx + 1,
                 "name": str(item.get('name', '未命名')),
                 "price": int(item.get('price', 0)),
-                "description": str(item.get('description', '')) # 新增描述欄位
+                "description": str(item.get('description', ''))
             })
             
         return jsonify({
@@ -149,25 +151,20 @@ def analyze_menu():
         print(f"❌ 錯誤: {e}")
         return jsonify({"name": "系統錯誤", "menu": [{"id":1, "name": str(e), "price": 0}]})
 
-# --- 2. 餐廳資料庫 API (新增) ---
-
+# --- 2. 餐廳資料庫 API ---
 @app.route("/api/restaurants", methods=['GET'])
 def get_restaurants():
-    # 回傳所有已儲存的餐廳列表 (轉換為 list 供前端選單使用)
-    # 按名稱排序
     r_list = sorted(list(restaurants_db.values()), key=lambda x: x['name'])
     return jsonify(r_list)
 
-# --- 3. 群組與訂單 API (修改：自動儲存餐廳、刪單功能) ---
-
+# --- 3. 團購功能 API ---
 @app.route("/api/create_group", methods=['POST'])
 def create_group():
     data = request.json
     restaurant_data = data['restaurant']
     restaurant_name = restaurant_data.get('name', '未命名餐廳')
 
-    # 【功能 3】保存/更新餐廳資料
-    # 直接用店名當 Key，如果 Key 存在就直接覆蓋 (更新菜單)
+    # 儲存餐廳資料
     restaurants_db[restaurant_name] = restaurant_data
     save_json(RESTAURANT_FILE, restaurants_db)
 
@@ -184,7 +181,11 @@ def create_group():
 
 @app.route("/api/group/<group_id>", methods=['GET'])
 def get_group(group_id):
-    return jsonify(fake_db.get(group_id) or {})
+    group = fake_db.get(group_id)
+    if group:
+        return jsonify(group)
+    # 重要：回傳 404 讓前端知道資料遺失
+    return jsonify({"error": "Group not found"}), 404
 
 @app.route("/api/group/<group_id>/order", methods=['POST'])
 def submit_order(group_id):
@@ -199,12 +200,10 @@ def submit_order(group_id):
         return jsonify({"success": True})
     return jsonify({"error": "Not found"}), 404
 
-# 【功能 2】刪除訂單 API
 @app.route("/api/group/<group_id>/order/<order_id>", methods=['DELETE'])
 def delete_order(group_id, order_id):
     if group_id in fake_db:
         orders = fake_db[group_id]['orders']
-        # 篩選掉該 ID 的訂單
         new_orders = [o for o in orders if str(o['id']) != str(order_id)]
         
         if len(orders) == len(new_orders):
