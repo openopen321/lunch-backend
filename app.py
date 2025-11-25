@@ -7,7 +7,7 @@ from flask_cors import CORS
 import google.generativeai as genai
 
 app = Flask(__name__)
-# 設定最大上傳限制為 16MB (避免圖片太大報錯)
+# 設定最大上傳限制為 16MB
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 CORS(app)
 
@@ -16,7 +16,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# 取得版本號 (除錯用)
+# 取得版本號
 try:
     import importlib.metadata
     LIB_VERSION = importlib.metadata.version("google-generativeai")
@@ -27,7 +27,22 @@ fake_db = {}
 
 @app.route("/")
 def home():
-    return f"Universal Vision API Running! (Lib: {LIB_VERSION})"
+    return f"Auto-Detect Vision API Running! Lib: {LIB_VERSION}"
+
+def get_usable_models():
+    """
+    直接詢問 Google 帳號目前可用的模型列表
+    """
+    models = []
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                # 移除 'models/' 前綴，只留名稱
+                name = m.name.replace("models/", "")
+                models.append(name)
+    except Exception as e:
+        print(f"無法列出模型: {e}")
+    return models
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
@@ -44,18 +59,13 @@ def analyze_menu():
         if not image_data:
             raise Exception("未收到圖片資料")
 
-        # 準備圖片物件
-        image_part = {
-            "mime_type": mime_type,
-            "data": image_data
-        }
-
-        # 定義提示詞
+        image_part = {"mime_type": mime_type, "data": image_data}
+        
         prompt = """
         你是一個專業的菜單辨識助手。請分析這張圖片。
         
         【任務】
-        1. 找出圖片中的「餐廳名稱」(如果沒寫，請根據菜色推測一個合理的店名，例如"巷口麵店")。
+        1. 找出圖片中的「餐廳名稱」(如果沒寫，請根據菜色推測一個合理的店名)。
         2. 辨識所有的「菜色名稱」與「價格」(數字)。
         3. 請忽略無關的文字。
 
@@ -71,34 +81,49 @@ def analyze_menu():
         }
         """
 
-        # --- 自動嘗試多種視覺模型 ---
-        # 依序嘗試，直到成功為止
-        candidate_models = [
-            "gemini-1.5-flash",       # 首選：快且便宜
-            "gemini-1.5-pro",         # 次選：強大
-            "gemini-2.0-flash-exp",   # 嘗鮮：最新版
-            "gemini-pro-vision"       # 保底：舊版視覺模型
-        ]
+        # --- 步驟 1: 獲取所有可用模型 ---
+        available_models = get_usable_models()
+        print(f"帳號可用模型: {available_models}")
+
+        # --- 步驟 2: 排序策略 ---
+        # 我們優先嘗試名字裡有 'flash' (快) 或 'vision' (視覺) 的模型
+        # 如果都沒有，就嘗試 'pro'
+        def sort_priority(name):
+            score = 0
+            if 'flash' in name: score += 3
+            if 'vision' in name: score += 2
+            if 'pro' in name: score += 1
+            if 'legacy' in name: score -= 5 # 舊版最後試
+            return score
+
+        # 將模型依優先順序排列
+        candidate_models = sorted(available_models, key=sort_priority, reverse=True)
+        
+        # 如果列表是空的 (API Key 權限問題)，手動加入幾個常見的試試看
+        if not candidate_models:
+            candidate_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-vision"]
 
         response = None
         used_model = ""
-        last_error = ""
+        errors = []
 
+        # --- 步驟 3: 逐一嘗試 ---
         for model_name in candidate_models:
             try:
-                print(f"嘗試使用模型: {model_name}")
+                print(f"正在嘗試模型: {model_name}")
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content([prompt, image_part])
                 used_model = model_name
-                print(f"成功使用 {model_name}！")
-                break # 成功就跳出迴圈
+                print(f"🎉 成功使用 {model_name}！")
+                break # 成功就跳出
             except Exception as e:
                 print(f"{model_name} 失敗: {e}")
-                last_error = str(e)
-                continue # 失敗就換下一個
+                errors.append(f"{model_name}: {str(e)[:20]}...")
+                continue
 
         if not response:
-            raise Exception(f"所有視覺模型都失敗。最後錯誤: {last_error}")
+            error_summary = "; ".join(errors)
+            raise Exception(f"所有模型都失敗。可用模型: {available_models}。錯誤: {error_summary}")
         
         # 解析結果
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
@@ -127,14 +152,14 @@ def analyze_menu():
         error_str = str(e)
         print(f"❌ 發生錯誤: {error_str}")
         return jsonify({
-            "name": f"錯誤: {error_str[:50]}...", # 顯示簡短錯誤
+            "name": f"錯誤: {error_str[:100]}...", 
             "address": f"Lib: {LIB_VERSION}",
             "phone": "",
             "minDelivery": 0,
             "menu": [{"id": 1, "name": "系統發生錯誤", "price": 0}]
         })
 
-# --- 其他 API ---
+# --- 其他 API (保持不變) ---
 @app.route("/api/create_group", methods=['POST'])
 def create_group():
     data = request.json
