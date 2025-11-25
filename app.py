@@ -15,7 +15,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# 取得當前安裝的套件版本
+# 取得版本號 (確認用)
 try:
     import importlib.metadata
     LIB_VERSION = importlib.metadata.version("google-generativeai")
@@ -26,7 +26,7 @@ fake_db = {}
 
 @app.route("/")
 def home():
-    return f"Detective API Running! Lib Version: {LIB_VERSION}"
+    return f"Gemini 2.5 Backend Running! (Lib: {LIB_VERSION})"
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
@@ -38,46 +38,79 @@ def analyze_menu():
         if not GEMINI_API_KEY:
             raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
-        # --- 嘗試建立模型 (多重備援機制) ---
+        # --- 2025年版模型切換邏輯 ---
         model = None
         used_model_name = ""
         
-        # 方案 A: 最新版 Gemini 1.5 Flash
+        # 1. 優先嘗試：Gemini 2.5 Pro (2025年旗艦模型，具備強大搜尋與推理)
         try:
-            print(f"嘗試使用 gemini-1.5-flash (Lib: {LIB_VERSION})")
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            used_model_name = "gemini-1.5-flash"
-            # 測試性呼叫 (確認模型存在)
-            # model.generate_content("test") 
-        except Exception as e:
-            print(f"Flash 失敗: {e}")
-            
-            # 方案 B: 舊版 Gemini Pro (相容性最高)
+            print("嘗試模型 1: gemini-2.5-pro")
+            tools = {'google_search': {}}
+            model = genai.GenerativeModel('gemini-2.5-pro', tools=tools)
+            used_model_name = "gemini-2.5-pro"
+        except:
+            pass
+
+        # 2. 次要嘗試：Gemini 2.5 Flash (2025年快速模型)
+        if not model:
             try:
-                print("降級嘗試 gemini-pro")
-                model = genai.GenerativeModel('gemini-pro')
-                used_model_name = "gemini-pro"
-            except Exception as e2:
-                raise Exception(f"所有模型都失敗。Lib版本: {LIB_VERSION}, 錯誤: {e2}")
+                print("嘗試模型 2: gemini-2.5-flash")
+                model = genai.GenerativeModel('gemini-2.5-flash', tools={'google_search': {}})
+                used_model_name = "gemini-2.5-flash"
+            except:
+                pass
+
+        # 3. 舊版備援：如果 2.5 都還沒開放，回退到 1.5 系列 (Legacy)
+        if not model:
+            try:
+                print("嘗試模型 3: gemini-1.5-pro (Legacy)")
+                model = genai.GenerativeModel('gemini-1.5-pro', tools={'google_search': {}})
+                used_model_name = "gemini-1.5-pro"
+            except:
+                pass
+
+        # 4. 最後防線
+        if not model:
+            print("嘗試模型 4: gemini-pro (Classic)")
+            model = genai.GenerativeModel('gemini-pro')
+            used_model_name = "gemini-pro"
 
         # --- 開始分析 ---
         prompt = f"""
-        請調查這個餐廳網址：{url}
-        請找出「店名」與「菜單」。
-        如果無法上網，請根據網址猜測店名，並隨機生成一份合理的台灣午餐菜單。
+        你是一個專業的台灣團購小幫手。請調查這個 Google Maps 餐廳連結：{url}
         
-        回傳 JSON 格式：
+        【任務】
+        1. 利用 Google 搜尋找出「正確店名」。
+        2. 找出最新的「菜單」與「價格」(台幣)。
+        3. 請忽略營業時間（即使休息中也要找出菜單）。
+
+        【輸出 JSON 格式】
         {{
             "name": "店名",
             "address": "地址",
             "phone": "電話",
             "minDelivery": 0,
-            "menu": [{{ "id": 1, "name": "範例餐點", "price": 100 }}]
+            "menu": [
+                {{ "id": 1, "name": "餐點名稱", "price": 100 }}
+            ]
         }}
         """
         
-        response = model.generate_content(prompt)
-        
+        # 執行 AI
+        try:
+            response = model.generate_content(prompt)
+        except Exception as api_error:
+            print(f"模型 {used_model_name} 執行失敗: {api_error}")
+            # 遇到 404 Not Found 代表該模型真的沒了，自動降級重試
+            if "404" in str(api_error) or "not found" in str(api_error):
+                print("模型不存在，降級使用 gemini-pro 重試")
+                model = genai.GenerativeModel('gemini-pro')
+                used_model_name = "gemini-pro (Fallback)"
+                response = model.generate_content(prompt)
+            else:
+                raise api_error
+
+        # 解析結果
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
         try:
             match = re.search(r'\{.*\}', clean_json, re.DOTALL)
@@ -87,11 +120,11 @@ def analyze_menu():
                 ai_data = json.loads(clean_json)
         except:
             ai_data = {
-                "name": f"AI 回傳格式錯誤 ({used_model_name})",
+                "name": f"讀取失敗 ({used_model_name})",
                 "address": "請手動輸入",
                 "phone": "",
                 "minDelivery": 0,
-                "menu": [{"id": 1, "name": "請手動輸入", "price": 0}]
+                "menu": [{"id": 1, "name": "請手動輸入餐點", "price": 0}]
             }
 
         # 補 ID
@@ -104,12 +137,9 @@ def analyze_menu():
         error_str = str(e)
         print(f"❌ 發生錯誤: {error_str}")
         
-        # 回傳詳細的除錯資訊給前端
-        debug_info = f"錯誤: {error_str} (Lib: {LIB_VERSION})"
-
         return jsonify({
-            "name": debug_info,
-            "address": "請截圖給 AI 看",
+            "name": f"錯誤: {error_str}",
+            "address": f"Model: {used_model_name}", 
             "phone": "",
             "minDelivery": 0,
             "menu": [{"id": 1, "name": "無法載入", "price": 0}]
