@@ -15,18 +15,46 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# 取得版本號 (確認用)
-try:
-    import importlib.metadata
-    LIB_VERSION = importlib.metadata.version("google-generativeai")
-except:
-    LIB_VERSION = "未知"
+# --- 關鍵功能：自動尋找可用模型 ---
+def get_best_available_model():
+    """
+    不猜測模型名稱，直接詢問 API 有哪些模型可用，
+    並優先選擇含有 'flash' 或 'pro' 的生成模型。
+    """
+    try:
+        print("正在查詢可用模型清單...")
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        print(f"找到的模型: {available_models}")
+
+        # 策略 1: 優先找 Flash (速度快)
+        for name in available_models:
+            if 'flash' in name.lower() and 'legacy' not in name.lower():
+                return name
+        
+        # 策略 2: 其次找 Pro (性能強)
+        for name in available_models:
+            if 'pro' in name.lower() and 'legacy' not in name.lower():
+                return name
+                
+        # 策略 3: 隨便回傳第一個能用的
+        if available_models:
+            return available_models[0]
+            
+    except Exception as e:
+        print(f"查詢模型失敗: {e}")
+    
+    # 如果連查詢都失敗，只好回傳一個最通用的預設值
+    return "models/gemini-1.5-flash"
 
 fake_db = {} 
 
 @app.route("/")
 def home():
-    return f"Gemini 2.5 Backend Running! (Lib: {LIB_VERSION})"
+    return "Auto-Discovery AI Lunch API is Running!"
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
@@ -38,49 +66,23 @@ def analyze_menu():
         if not GEMINI_API_KEY:
             raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
-        # --- 2025年版模型切換邏輯 ---
-        model = None
-        used_model_name = ""
-        
-        # 1. 優先嘗試：Gemini 2.5 Pro (2025年旗艦模型，具備強大搜尋與推理)
+        # 動態取得最佳模型
+        model_name = get_best_available_model()
+        print(f"決定使用的模型: {model_name}")
+
         try:
-            print("嘗試模型 1: gemini-2.5-pro")
+            # 嘗試啟用搜尋工具
             tools = {'google_search': {}}
-            model = genai.GenerativeModel('gemini-2.5-pro', tools=tools)
-            used_model_name = "gemini-2.5-pro"
+            model = genai.GenerativeModel(model_name, tools=tools)
         except:
-            pass
+            print("搜尋工具不可用，降級為普通模式")
+            model = genai.GenerativeModel(model_name)
 
-        # 2. 次要嘗試：Gemini 2.5 Flash (2025年快速模型)
-        if not model:
-            try:
-                print("嘗試模型 2: gemini-2.5-flash")
-                model = genai.GenerativeModel('gemini-2.5-flash', tools={'google_search': {}})
-                used_model_name = "gemini-2.5-flash"
-            except:
-                pass
-
-        # 3. 舊版備援：如果 2.5 都還沒開放，回退到 1.5 系列 (Legacy)
-        if not model:
-            try:
-                print("嘗試模型 3: gemini-1.5-pro (Legacy)")
-                model = genai.GenerativeModel('gemini-1.5-pro', tools={'google_search': {}})
-                used_model_name = "gemini-1.5-pro"
-            except:
-                pass
-
-        # 4. 最後防線
-        if not model:
-            print("嘗試模型 4: gemini-pro (Classic)")
-            model = genai.GenerativeModel('gemini-pro')
-            used_model_name = "gemini-pro"
-
-        # --- 開始分析 ---
         prompt = f"""
         你是一個專業的台灣團購小幫手。請調查這個 Google Maps 餐廳連結：{url}
         
         【任務】
-        1. 利用 Google 搜尋找出「正確店名」。
+        1. 找出「正確店名」。
         2. 找出最新的「菜單」與「價格」(台幣)。
         3. 請忽略營業時間（即使休息中也要找出菜單）。
 
@@ -100,15 +102,8 @@ def analyze_menu():
         try:
             response = model.generate_content(prompt)
         except Exception as api_error:
-            print(f"模型 {used_model_name} 執行失敗: {api_error}")
-            # 遇到 404 Not Found 代表該模型真的沒了，自動降級重試
-            if "404" in str(api_error) or "not found" in str(api_error):
-                print("模型不存在，降級使用 gemini-pro 重試")
-                model = genai.GenerativeModel('gemini-pro')
-                used_model_name = "gemini-pro (Fallback)"
-                response = model.generate_content(prompt)
-            else:
-                raise api_error
+            # 如果這裡還錯，代表 API Key 可能有問題 (例如沒有權限存取該模型)
+            raise Exception(f"模型 {model_name} 執行失敗: {api_error}")
 
         # 解析結果
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
@@ -120,7 +115,7 @@ def analyze_menu():
                 ai_data = json.loads(clean_json)
         except:
             ai_data = {
-                "name": f"讀取失敗 ({used_model_name})",
+                "name": f"讀取失敗 ({model_name})",
                 "address": "請手動輸入",
                 "phone": "",
                 "minDelivery": 0,
@@ -139,7 +134,7 @@ def analyze_menu():
         
         return jsonify({
             "name": f"錯誤: {error_str}",
-            "address": f"Model: {used_model_name}", 
+            "address": "請檢查後端 Logs", 
             "phone": "",
             "minDelivery": 0,
             "menu": [{"id": 1, "name": "無法載入", "price": 0}]
