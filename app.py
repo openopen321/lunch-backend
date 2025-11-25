@@ -2,6 +2,7 @@ import os
 import json
 import re
 import uuid
+import sys
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -14,11 +15,18 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+# 取得當前安裝的套件版本
+try:
+    import importlib.metadata
+    LIB_VERSION = importlib.metadata.version("google-generativeai")
+except:
+    LIB_VERSION = "未知"
+
 fake_db = {} 
 
 @app.route("/")
 def home():
-    return "Gemini 1.5 Pro Backend is Running!"
+    return f"Detective API Running! Lib Version: {LIB_VERSION}"
 
 @app.route("/api/analyze_menu", methods=['POST'])
 def analyze_menu():
@@ -30,38 +38,46 @@ def analyze_menu():
         if not GEMINI_API_KEY:
             raise Exception("Render 環境變數中找不到 GEMINI_API_KEY")
 
-        # 建立模型 (嘗試多種可能)
+        # --- 嘗試建立模型 (多重備援機制) ---
         model = None
+        used_model_name = ""
+        
+        # 方案 A: 最新版 Gemini 1.5 Flash
         try:
-            # 首選：Gemini 1.5 Pro + 搜尋工具 (更聰明)
-            tools = {'google_search': {}}
-            model = genai.GenerativeModel('gemini-1.5-pro', tools=tools)
-            print("使用模型: Gemini 1.5 Pro (含搜尋)")
-        except:
-            # 備案：如果 Pro 失敗，嘗試 Flash
-            print("Pro 模式失敗，降級為 Flash")
+            print(f"嘗試使用 gemini-1.5-flash (Lib: {LIB_VERSION})")
             model = genai.GenerativeModel('gemini-1.5-flash')
+            used_model_name = "gemini-1.5-flash"
+            # 測試性呼叫 (確認模型存在)
+            # model.generate_content("test") 
+        except Exception as e:
+            print(f"Flash 失敗: {e}")
+            
+            # 方案 B: 舊版 Gemini Pro (相容性最高)
+            try:
+                print("降級嘗試 gemini-pro")
+                model = genai.GenerativeModel('gemini-pro')
+                used_model_name = "gemini-pro"
+            except Exception as e2:
+                raise Exception(f"所有模型都失敗。Lib版本: {LIB_VERSION}, 錯誤: {e2}")
 
+        # --- 開始分析 ---
         prompt = f"""
         請調查這個餐廳網址：{url}
-        這是一個 Google Maps 連結。
-        請利用 Google 搜尋找出這家店的「正確店名」以及最新的「菜單」。
+        請找出「店名」與「菜單」。
+        如果無法上網，請根據網址猜測店名，並隨機生成一份合理的台灣午餐菜單。
         
-        【輸出格式 JSON】
+        回傳 JSON 格式：
         {{
             "name": "店名",
             "address": "地址",
             "phone": "電話",
             "minDelivery": 0,
-            "menu": [
-                {{ "id": 1, "name": "餐點名稱", "price": 100 }}
-            ]
+            "menu": [{{ "id": 1, "name": "範例餐點", "price": 100 }}]
         }}
         """
         
         response = model.generate_content(prompt)
         
-        # 清理並解析 JSON
         clean_json = response.text.replace('```json', '').replace('```', '').strip()
         try:
             match = re.search(r'\{.*\}', clean_json, re.DOTALL)
@@ -70,10 +86,9 @@ def analyze_menu():
             else:
                 ai_data = json.loads(clean_json)
         except:
-            # 如果 AI 還是沒給 JSON，手動構造一個
             ai_data = {
-                "name": "AI 讀取失敗",
-                "address": "",
+                "name": f"AI 回傳格式錯誤 ({used_model_name})",
+                "address": "請手動輸入",
                 "phone": "",
                 "minDelivery": 0,
                 "menu": [{"id": 1, "name": "請手動輸入", "price": 0}]
@@ -89,12 +104,12 @@ def analyze_menu():
         error_str = str(e)
         print(f"❌ 發生錯誤: {error_str}")
         
-        if "404" in error_str and "not found" in error_str:
-            error_str = "請確認 requirements.txt 已更新，並且 Render 已重新部署"
+        # 回傳詳細的除錯資訊給前端
+        debug_info = f"錯誤: {error_str} (Lib: {LIB_VERSION})"
 
         return jsonify({
-            "name": f"錯誤: {error_str}",
-            "address": "請檢查後端設定",
+            "name": debug_info,
+            "address": "請截圖給 AI 看",
             "phone": "",
             "minDelivery": 0,
             "menu": [{"id": 1, "name": "無法載入", "price": 0}]
